@@ -30,6 +30,6 @@ depends = "$auto, openssh-client"
 suggests = "azure-cli"
 assets = [
   ["target/release/leeloo", "usr/bin/", "755"],
-  ["assets/tech.smag.Leeloo.desktop", "usr/share/applications/", "644"],
-  ["assets/tech.smag.Leeloo.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+  ["assets/io.github.Schoomee.Leeloo.desktop", "usr/share/applications/", "644"],
+  ["assets/io.github.Schoomee.Leeloo.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
 ]

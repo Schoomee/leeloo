@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-const APP_ID: &str = "tech.smag.Leeloo";
+const APP_ID: &str = "io.github.Schoomee.Leeloo";
 
 fn main() -> gtk::glib::ExitCode {
     // Reprise de l'ancien dossier de configuration (avant le renommage en Leeloo).

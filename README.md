@@ -144,7 +144,7 @@ Le paquet est produit dans `target/debian/`.
   `tab_title`, `tab_nav`, `private_file`).
 - `src/main.rs`, `terminal.rs`, `sessions_panel.rs`, `azure_dialog.rs`,
   `rename_dialog.rs`, `style.rs` : interface GTK, volontairement fine.
-- `assets/` : fichier `.desktop` et icône (identifiant `tech.smag.Leeloo`).
+- `assets/` : fichier `.desktop` et icône (identifiant `io.github.Schoomee.Leeloo`).
 
 Les tests couvrent la logique pure. L'interface graphique n'a pas de test
 automatisé : elle se vérifie à la main.
