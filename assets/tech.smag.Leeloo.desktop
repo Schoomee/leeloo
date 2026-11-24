@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Leeloo
+GenericName=Terminal et connexions SSH
+Comment=Terminal local, sessions SSH et VM Azure (Entra ID)
+Exec=leeloo
+Icon=tech.smag.Leeloo
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=ssh;terminal;azure;entra;sftp;
+StartupNotify=true
+StartupWMClass=tech.smag.Leeloo
