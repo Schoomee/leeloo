@@ -1,0 +1,65 @@
+---
+name: Release
+
+# Publie une release GitHub avec le .deb quand un tag « vX.Y.Z » est poussé.
+# Le tag doit correspondre à la version de Cargo.toml.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Construire et publier le .deb
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Le tag correspond à la version de Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG" != "v${version}" ]; then
+            echo "Le tag ${TAG} ne correspond pas à la version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Dépendances système
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev
+
+      - name: Chaîne Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Contrôles avant publication
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      - name: Paquet .deb et somme de contrôle
+        run: |
+          cargo install cargo-deb --locked --version 3.8.0
+          cargo deb
+          cd target/debian
+          sha256sum ./*.deb > SHA256SUMS
+
+      - name: Créer la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            target/debian/*.deb target/debian/SHA256SUMS \
+            --title "$TAG" --generate-notes --verify-tag

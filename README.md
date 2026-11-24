@@ -1,5 +1,7 @@
 # Leeloo
 
+[![CI](https://github.com/Schoomee/leeloo/actions/workflows/ci.yml/badge.svg)](https://github.com/Schoomee/leeloo/actions/workflows/ci.yml)
+
 Client de terminal pour Ubuntu, inspiré de MobaXterm : un terminal local, des
 sessions SSH organisées en dossiers et un sélecteur de VM Azure avec connexion
 Entra ID (`az ssh vm`). Application native GTK4 / libadwaita / VTE, écrite en
@@ -35,7 +37,12 @@ Rust.
 
 Cible : Ubuntu 24.04 (GTK 4.14, libadwaita 1.5, VTE 0.76).
 
+Télécharger le `.deb` et `SHA256SUMS` depuis la page
+[Releases](https://github.com/Schoomee/leeloo/releases), vérifier la somme de
+contrôle, puis installer :
+
 ```bash
+sha256sum -c SHA256SUMS --ignore-missing
 sudo apt install ./leeloo_0.1.0-1_amd64.deb
 ```
 
@@ -136,6 +143,21 @@ cargo install cargo-deb && cargo deb         # construire le paquet .deb
 ```
 
 Le paquet est produit dans `target/debian/`.
+
+### CI et publication
+
+- `.github/workflows/ci.yml` : à chaque push sur `main` et chaque pull request,
+  format, lint (clippy), tests, puis construction du `.deb` (disponible comme
+  artefact du workflow).
+- `.github/workflows/release.yml` : publie une release GitHub avec le `.deb` et
+  `SHA256SUMS` quand un tag `vX.Y.Z` est poussé. Le tag doit correspondre à la
+  `version` de `Cargo.toml`.
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Les actions GitHub utilisées sont officielles et épinglées par SHA.
 
 ### Organisation
 
