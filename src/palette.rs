@@ -101,6 +101,16 @@ pub const SESSION_COLORS: &[(&str, &str)] = &[
     ("Gris", "#9a9996"),
 ];
 
+/// Couleur d'un nouvel onglet : la première de `SESSION_COLORS` absente de
+/// `used` ; quand toutes sont prises, on refait un tour.
+pub fn next_tab_color(used: &[String]) -> &'static str {
+    SESSION_COLORS
+        .iter()
+        .map(|(_, hex)| *hex)
+        .find(|hex| !used.iter().any(|known| known.eq_ignore_ascii_case(hex)))
+        .unwrap_or(SESSION_COLORS[used.len() % SESSION_COLORS.len()].1)
+}
+
 const SOLARIZED_COLORS: [&str; 16] = [
     "#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682", "#2aa198", "#eee8d5",
     "#002b36", "#cb4b16", "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1", "#fdf6e3",
@@ -181,6 +191,26 @@ mod tests {
                     .all(|(_, other)| other != hex)
             );
         }
+    }
+
+    #[test]
+    fn tab_colors_are_distinct_until_the_palette_is_exhausted() {
+        let mut used: Vec<String> = Vec::new();
+        for _ in 0..SESSION_COLORS.len() {
+            let color = next_tab_color(&used);
+            assert!(!used.iter().any(|known| known == color), "{color}");
+            used.push(color.to_owned());
+        }
+        // Palette épuisée : on repart du début, sans panique.
+        assert_eq!(next_tab_color(&used), SESSION_COLORS[0].1);
+        // Une couleur libérée est réutilisée en premier.
+        used.remove(2);
+        assert_eq!(next_tab_color(&used), SESSION_COLORS[2].1);
+        // Insensible à la casse.
+        assert_eq!(
+            next_tab_color(&[SESSION_COLORS[0].1.to_uppercase()]),
+            SESSION_COLORS[1].1
+        );
     }
 
     #[test]

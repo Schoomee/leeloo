@@ -51,6 +51,24 @@ pub struct SessionStore {
     folders: Vec<String>,
 }
 
+/// Dossier retiré du magasin (annulation possible).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderBackup {
+    path: String,
+    sessions: Vec<Session>,
+    folders: Vec<String>,
+}
+
+impl FolderBackup {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+}
+
 /// Séparateur de niveaux dans un chemin de dossier (« Azure/Dev »).
 pub const FOLDER_SEPARATOR: char = '/';
 const MAX_FOLDER_DEPTH: usize = 6;
@@ -307,15 +325,17 @@ impl SessionStore {
 
     /// Nombre de sessions dans le dossier et ses sous-dossiers.
     pub fn sessions_in_subtree(&self, folder: &str) -> usize {
-        self.sessions
-            .iter()
-            .filter(|session| {
-                session
-                    .folder
-                    .as_deref()
-                    .is_some_and(|path| is_within(path, folder))
-            })
-            .count()
+        self.sessions_under(folder).count()
+    }
+
+    /// Sessions du dossier et de ses sous-dossiers.
+    pub fn sessions_under<'a>(&'a self, folder: &'a str) -> impl Iterator<Item = &'a Session> {
+        self.sessions.iter().filter(move |session| {
+            session
+                .folder
+                .as_deref()
+                .is_some_and(|path| is_within(path, folder))
+        })
     }
 
     /// Crée un dossier sous `parent` (`None` = racine). `name` peut contenir
@@ -459,18 +479,57 @@ impl SessionStore {
     /// Supprime un dossier avec ses sous-dossiers et toutes les sessions qu'ils
     /// contiennent. Retourne le nombre de sessions supprimées.
     pub fn delete_folder(&mut self, path: &str) -> Result<usize, FolderError> {
+        self.take_folder(path).map(|backup| backup.sessions.len())
+    }
+
+    /// Retire un dossier (sous-dossiers et sessions compris) et le retourne,
+    /// pour pouvoir l'annuler avec `restore_folder`.
+    pub fn take_folder(&mut self, path: &str) -> Result<FolderBackup, FolderError> {
         if !self.folders().iter().any(|known| known == path) {
             return Err(FolderError::NotFound);
         }
-        let before = self.sessions.len();
-        self.sessions.retain(|session| {
-            !session
-                .folder
-                .as_deref()
-                .is_some_and(|folder| is_within(folder, path))
-        });
-        self.folders.retain(|known| !is_within(known, path));
-        Ok(before - self.sessions.len())
+        let (removed, kept): (Vec<Session>, Vec<Session>) = std::mem::take(&mut self.sessions)
+            .into_iter()
+            .partition(|session| {
+                session
+                    .folder
+                    .as_deref()
+                    .is_some_and(|folder| is_within(folder, path))
+            });
+        self.sessions = kept;
+        let (removed_folders, kept_folders): (Vec<String>, Vec<String>) =
+            std::mem::take(&mut self.folders)
+                .into_iter()
+                .partition(|known| is_within(known, path));
+        self.folders = kept_folders;
+        Ok(FolderBackup {
+            path: path.to_owned(),
+            sessions: removed,
+            folders: removed_folders,
+        })
+    }
+
+    /// Remet en place un dossier retiré. Les modifications faites depuis sont
+    /// conservées : une session dont l'identifiant a été repris reçoit un nouvel
+    /// identifiant, un dossier déjà recréé n'est pas dupliqué. Retourne le
+    /// nombre de sessions rétablies.
+    pub fn restore_folder(&mut self, backup: FolderBackup) -> usize {
+        let restored = backup.sessions.len();
+        for folder in backup.folders {
+            if !self.folders.contains(&folder) {
+                self.folders.push(folder);
+            }
+        }
+        if restored == 0 && !self.folders().contains(&backup.path) {
+            self.folders.push(backup.path);
+        }
+        for mut session in backup.sessions {
+            if self.get(session.id).is_some() {
+                session.id = self.next_id();
+            }
+            self.sessions.push(session);
+        }
+        restored
     }
 
     /// Sessions d'un dossier (`None` = racine), triées par nom.
@@ -482,6 +541,21 @@ impl SessionStore {
             .collect();
         sessions.sort_by_key(|session| session.name.to_lowercase());
         sessions
+    }
+
+    /// Identifiants des sessions qui correspondent à la recherche rapide ;
+    /// `None` si la requête est vide (pas de filtre).
+    pub fn search(&self, query: &str) -> Option<std::collections::HashSet<u64>> {
+        if query.trim().is_empty() {
+            return None;
+        }
+        Some(
+            self.sessions
+                .iter()
+                .filter(|session| session.matches(query))
+                .map(|session| session.id)
+                .collect(),
+        )
     }
 
     /// Ajoute une session SSH par alias absent du magasin ; ignore les alias
@@ -545,6 +619,85 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
         directory
+    }
+
+    #[test]
+    fn search_matches_all_words_across_name_host_and_folder() {
+        let mut store = SessionStore::new();
+        let web = store
+            .add(
+                "web front",
+                Some("Prod/Front"),
+                ssh_kind("web1.example.com"),
+            )
+            .unwrap();
+        let db = store
+            .add("base", Some("Prod"), ssh_kind("db1.example.com"))
+            .unwrap();
+        let other = store.add("autre", None, ssh_kind("x.example.org")).unwrap();
+
+        assert_eq!(store.search(""), None);
+        assert_eq!(store.search("   "), None);
+        let prod = store.search("PROD").unwrap();
+        assert!(prod.contains(&web) && prod.contains(&db) && !prod.contains(&other));
+        let both = store.search("prod web1").unwrap();
+        assert_eq!(both.len(), 1);
+        assert!(both.contains(&web));
+        assert!(store.search("introuvable").unwrap().is_empty());
+    }
+
+    #[test]
+    fn undoing_a_folder_deletion_restores_sessions_and_subfolders() {
+        let mut store = SessionStore::new();
+        store.create_folder(None, "Prod/Front").unwrap();
+        let web = store
+            .add("web", Some("Prod/Front"), ssh_kind("web.example.com"))
+            .unwrap();
+        let db = store
+            .add("db", Some("Prod"), ssh_kind("db.example.com"))
+            .unwrap();
+        let keep = store.add("keep", None, ssh_kind("k.example.com")).unwrap();
+        let before = store.clone();
+
+        let backup = store.take_folder("Prod").unwrap();
+        assert_eq!((backup.path(), backup.session_count()), ("Prod", 2));
+        assert!(store.get(web).is_none() && store.get(db).is_none());
+        assert!(store.get(keep).is_some());
+        assert!(!store.folders().contains(&"Prod/Front".to_owned()));
+
+        assert_eq!(store.restore_folder(backup), 2);
+        assert_eq!(store.folders(), before.folders());
+        assert_eq!(store.get(web), before.get(web));
+        assert_eq!(store.get(db), before.get(db));
+    }
+
+    #[test]
+    fn undo_keeps_later_changes_and_resolves_id_clashes() {
+        let mut store = SessionStore::new();
+        let old = store
+            .add("old", Some("Tmp"), ssh_kind("old.example.com"))
+            .unwrap();
+        let backup = store.take_folder("Tmp").unwrap();
+        // Entre-temps : une nouvelle session reprend l'identifiant libéré.
+        let newer = store.add("new", None, ssh_kind("new.example.com")).unwrap();
+        assert_eq!(newer, old);
+
+        assert_eq!(store.restore_folder(backup), 1);
+        assert_eq!(store.get(newer).unwrap().name, "new");
+        let restored: Vec<_> = store.in_folder(Some("Tmp"));
+        assert_eq!(restored.len(), 1);
+        assert_ne!(restored[0].id, newer);
+    }
+
+    #[test]
+    fn undo_of_an_empty_folder_and_unknown_folder() {
+        let mut store = SessionStore::new();
+        store.create_folder(None, "Vide").unwrap();
+        let backup = store.take_folder("Vide").unwrap();
+        assert!(!store.folders().contains(&"Vide".to_owned()));
+        assert_eq!(store.restore_folder(backup), 0);
+        assert!(store.folders().contains(&"Vide".to_owned()));
+        assert_eq!(store.take_folder("Absent"), Err(FolderError::NotFound));
     }
 
     #[test]

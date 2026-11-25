@@ -476,6 +476,7 @@ impl Dialog {
                     name,
                     argv,
                     terminal::TabStyle::default(),
+                    leeloo::workspace::PaneSource::Azure { vm: session },
                 );
                 self.history
                     .borrow_mut()

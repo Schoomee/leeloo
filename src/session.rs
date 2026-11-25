@@ -121,6 +121,22 @@ impl Session {
         }
     }
 
+    /// Recherche rapide : tous les mots de `query` (sans casse) doivent figurer
+    /// dans le nom, le résumé (hôte, utilisateur, VM…) ou le dossier. Une
+    /// requête vide correspond à tout.
+    pub fn matches(&self, query: &str) -> bool {
+        let haystack = format!(
+            "{} {} {}",
+            self.name,
+            self.summary(),
+            self.folder.as_deref().unwrap_or_default()
+        )
+        .to_lowercase();
+        query
+            .split_whitespace()
+            .all(|word| haystack.contains(&word.to_lowercase()))
+    }
+
     /// Commande à lancer, sous forme d'argv (jamais de `sh -c`).
     pub fn argv(&self) -> Result<Vec<String>, ValidationError> {
         self.validate()?;
@@ -170,6 +186,12 @@ impl SshSession {
 }
 
 impl AzureVmSession {
+    /// Commande `az ssh vm` après validation (jamais de `sh -c`).
+    pub fn checked_argv(&self) -> Result<Vec<String>, ValidationError> {
+        self.validate()?;
+        Ok(self.argv())
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         check_token("resource group", &self.resource_group)?;
         check_token("nom de VM", &self.vm_name)?;
