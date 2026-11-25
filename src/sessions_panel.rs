@@ -5,8 +5,9 @@ use adw::prelude::*;
 use leeloo::palette::{self, PALETTES, SESSION_COLORS};
 use leeloo::session::{AzureVmSession, Session, SessionKind, SshSession};
 use leeloo::ssh_config;
-use leeloo::store::{FOLDER_SEPARATOR, IMPORT_FOLDER, SessionStore, folder_name};
-use std::cell::RefCell;
+use leeloo::store::{FOLDER_SEPARATOR, FolderBackup, IMPORT_FOLDER, SessionStore, folder_name};
+use leeloo::workspace::PaneSource;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -15,10 +16,43 @@ use std::rc::Rc;
 type FolderAction = fn(&Rc<Panel>, &str);
 
 const INDENT: i32 = 18;
+
+fn tab_style(session: &Session) -> terminal::TabStyle {
+    terminal::TabStyle {
+        color: session.color.clone(),
+        palette: session.palette.as_deref().and_then(palette::by_id),
+    }
+}
+
+fn folder_icon(collapsed: bool) -> &'static str {
+    if collapsed {
+        "folder-symbolic"
+    } else {
+        "folder-open-symbolic"
+    }
+}
 const AZURE_FOLDER: &str = "Azure";
 
+/// Durée du déroulement d'un dossier (ignorée si les animations sont coupées).
+const FOLDER_ANIMATION_MS: u32 = 220;
+
+/// Ligne affichée, avec de quoi la révéler ou la masquer en douceur.
+struct RowEntry {
+    revealer: gtk::Revealer,
+    /// Dossiers qui contiennent la ligne, du plus externe au plus interne.
+    ancestors: Vec<String>,
+    /// Pour une ligne de dossier : son chemin et l'icône ouvert/fermé.
+    folder: Option<(String, gtk::Image)>,
+}
+
 struct Panel {
-    list: gtk::ListBox,
+    list: gtk::Box,
+    rows: RefCell<Vec<RowEntry>>,
+    /// Recherche rapide : texte saisi et sessions retenues (`None` = pas de filtre).
+    filter: RefCell<String>,
+    matches: RefCell<Option<HashSet<u64>>>,
+    /// Première session affichée (Entrée dans le champ la lance).
+    first_match: Cell<Option<u64>>,
     /// Dossiers repliés (état de la session en cours).
     collapsed: RefCell<HashSet<String>>,
     store: RefCell<SessionStore>,
@@ -41,12 +75,20 @@ pub fn build(
         None => (SessionStore::new(), None),
     };
 
-    let list = gtk::ListBox::new();
-    list.add_css_class("navigation-sidebar");
-    list.set_selection_mode(gtk::SelectionMode::None);
+    // Chaque ligne a sa propre liste dans un `Revealer` : le dossier se déroule
+    // en animant la hauteur des lignes, sans reconstruire la liste.
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list.set_margin_top(6);
+    list.set_margin_bottom(6);
+    list.set_margin_start(6);
+    list.set_margin_end(6);
 
     let panel = Rc::new(Panel {
         list: list.clone(),
+        rows: RefCell::new(Vec::new()),
+        filter: RefCell::new(String::new()),
+        matches: RefCell::new(None),
+        first_match: Cell::new(None),
         collapsed: RefCell::new(HashSet::new()),
         store: RefCell::new(store),
         // Fichier illisible : on n'écrase rien tant que l'utilisateur ne le corrige pas.
@@ -93,7 +135,42 @@ pub fn build(
     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
     // Fond opaque : le volet n'est plus dans un conteneur libadwaita qui le peint.
     container.add_css_class("leeloo-sidebar");
+    let search_entry = gtk::SearchEntry::builder()
+        .placeholder_text("Rechercher une session (Ctrl+Maj+K)")
+        .margin_start(6)
+        .margin_end(6)
+        .margin_bottom(6)
+        .build();
+    search_entry.connect_search_changed({
+        let panel = panel.clone();
+        move |entry| panel.set_filter(&entry.text())
+    });
+    // Entrée lance la première session affichée.
+    search_entry.connect_activate({
+        let panel = panel.clone();
+        move |_| {
+            if let Some(id) = panel.first_match.get() {
+                panel.connect(id);
+            }
+        }
+    });
+    let search_action = gtk::gio::SimpleAction::new("search-sessions", None);
+    search_action.connect_activate({
+        let container = container.downgrade();
+        let entry = search_entry.downgrade();
+        move |_, _| {
+            if let (Some(container), Some(entry)) = (container.upgrade(), entry.upgrade()) {
+                container.set_visible(true);
+                entry.grab_focus();
+            }
+        }
+    });
+    window.add_action(&search_action);
+    if let Some(application) = window.application() {
+        application.set_accels_for_action("win.search-sessions", &["<Control><Shift>k"]);
+    }
     container.append(&actions);
+    container.append(&search_entry);
     container.append(&scrolled);
 
     panel.refresh();
@@ -105,6 +182,43 @@ pub fn build(
 pub struct SessionsHandle(Rc<Panel>);
 
 impl SessionsHandle {
+    /// Commande d'un volet à restaurer ; `None` si la session n'existe plus ou
+    /// n'est plus valide. La ligne de commande est toujours reconstruite et
+    /// validée ici, jamais lue du disque.
+    pub fn resolve_pane(&self, source: &PaneSource) -> Option<terminal::Launch> {
+        match source {
+            PaneSource::Local => Some(terminal::local_launch()),
+            PaneSource::Session { id } => {
+                let store = self.0.store.borrow();
+                let session = store.get(*id)?;
+                Some(terminal::Launch {
+                    title: session.name.clone(),
+                    argv: session.argv().ok()?,
+                    close_on_exit: false,
+                    style: tab_style(session),
+                })
+            }
+            PaneSource::Azure { vm } => Some(terminal::Launch {
+                title: vm.vm_name.clone(),
+                argv: vm.checked_argv().ok()?,
+                close_on_exit: false,
+                style: terminal::TabStyle::default(),
+            }),
+        }
+    }
+
+    /// Dossiers repliés, pour la restauration de session.
+    pub fn collapsed_folders(&self) -> Vec<String> {
+        let mut folders: Vec<String> = self.0.collapsed.borrow().iter().cloned().collect();
+        folders.sort();
+        folders
+    }
+
+    pub fn restore_collapsed(&self, folders: &[String]) {
+        *self.0.collapsed.borrow_mut() = folders.iter().cloned().collect();
+        self.0.refresh();
+    }
+
     /// Enregistre une VM Azure dans le dossier « Azure » ; `Ok(false)` si elle
     /// l'est déjà.
     pub fn add_azure_vm(&self, name: &str, vm: AzureVmSession) -> Result<bool, String> {
@@ -137,27 +251,118 @@ impl Panel {
         }
     }
 
+    /// Applique la recherche rapide et reconstruit la liste.
+    fn set_filter(self: &Rc<Self>, text: &str) {
+        let text = text.trim().to_owned();
+        if *self.filter.borrow() == text {
+            return;
+        }
+        *self.filter.borrow_mut() = text;
+        self.refresh();
+    }
+
+    /// Une recherche en cours déroule tout : le repli ne s'applique pas.
+    fn is_collapsed(&self, path: &str) -> bool {
+        self.matches.borrow().is_none() && self.collapsed.borrow().contains(path)
+    }
+
     fn refresh(self: &Rc<Self>) {
-        self.list.remove_all();
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
+        self.rows.borrow_mut().clear();
         let store = self.store.borrow();
-        self.render_level(&store, None, 0);
+        *self.matches.borrow_mut() = store.search(&self.filter.borrow());
+        self.first_match.set(None);
+        self.render_level(&store, None, 0, &mut Vec::new());
+        if self.matches.borrow().is_some() && self.rows.borrow().is_empty() {
+            let empty = gtk::Label::new(Some("Aucune session ne correspond"));
+            empty.add_css_class("dim-label");
+            empty.set_margin_top(12);
+            self.list.append(&empty);
+        }
+    }
+
+    /// Ajoute une ligne dans son `Revealer` ; elle naît révélée ou masquée selon
+    /// l'état de ses dossiers parents, sans animation.
+    fn push_row(
+        &self,
+        row: &adw::ActionRow,
+        ancestors: &[String],
+        folder: Option<(String, gtk::Image)>,
+    ) {
+        let single = gtk::ListBox::new();
+        single.add_css_class("navigation-sidebar");
+        single.add_css_class("leeloo-row-list");
+        single.set_selection_mode(gtk::SelectionMode::None);
+        single.append(row);
+        let hidden = ancestors.iter().any(|path| self.is_collapsed(path));
+        let revealer = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .transition_duration(FOLDER_ANIMATION_MS)
+            .reveal_child(!hidden)
+            .child(&single)
+            .build();
+        self.list.append(&revealer);
+        self.rows.borrow_mut().push(RowEntry {
+            revealer,
+            ancestors: ancestors.to_vec(),
+            folder,
+        });
+    }
+
+    /// Aligne l'affichage sur l'état replié : les lignes concernées se
+    /// déroulent ou s'enroulent, les icônes de dossier suivent.
+    fn apply_collapsed(&self) {
+        for entry in self.rows.borrow().iter() {
+            let hidden = entry.ancestors.iter().any(|path| self.is_collapsed(path));
+            entry.revealer.set_reveal_child(!hidden);
+            if let Some((path, icon)) = &entry.folder {
+                icon.set_icon_name(Some(folder_icon(self.is_collapsed(path))));
+            }
+        }
     }
 
     /// Sous-dossiers (chacun suivi de son contenu s'il n'est pas replié), puis
     /// les sessions de ce niveau.
-    fn render_level(self: &Rc<Self>, store: &SessionStore, parent: Option<&str>, depth: i32) {
+    fn render_level(
+        self: &Rc<Self>,
+        store: &SessionStore,
+        parent: Option<&str>,
+        depth: i32,
+        ancestors: &mut Vec<String>,
+    ) {
         for folder in store.child_folders(parent) {
-            let collapsed = self.collapsed.borrow().contains(&folder);
-            self.list
-                .append(&self.folder_row(store, &folder, depth, collapsed));
-            if !collapsed {
-                self.render_level(store, Some(&folder), depth + 1);
+            // Recherche : seuls les dossiers qui contiennent un résultat restent.
+            if self.matches.borrow().as_ref().is_some_and(|ids| {
+                !store
+                    .sessions_under(&folder)
+                    .any(|session| ids.contains(&session.id))
+            }) {
+                continue;
             }
+            let collapsed = self.is_collapsed(&folder);
+            let (row, icon) = self.folder_row(store, &folder, depth, collapsed);
+            self.push_row(&row, ancestors, Some((folder.clone(), icon)));
+            ancestors.push(folder.clone());
+            self.render_level(store, Some(&folder), depth + 1, ancestors);
+            ancestors.pop();
         }
         for session in store.in_folder(parent) {
+            if self
+                .matches
+                .borrow()
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(&session.id))
+            {
+                continue;
+            }
+            if self.first_match.get().is_none() {
+                self.first_match.set(Some(session.id));
+            }
             let row = self.session_row(session);
             row.set_margin_start(depth * INDENT);
-            self.list.append(&row);
+            self.push_row(&row, ancestors, None);
         }
     }
 
@@ -167,19 +372,22 @@ impl Panel {
         path: &str,
         depth: i32,
         collapsed: bool,
-    ) -> adw::ActionRow {
+    ) -> (adw::ActionRow, gtk::Image) {
         let count = store.sessions_in_subtree(path);
         let row = adw::ActionRow::builder()
             .title(gtk::glib::markup_escape_text(folder_name(path)))
-            .subtitle(format!("{count} session(s)"))
             .activatable(true)
             .build();
+        // Le nombre de sessions tient sur la même ligne : ligne de dossier fine.
+        let count_label = gtk::Label::new(Some(&count.to_string()));
+        count_label.add_css_class("dim-label");
+        count_label.add_css_class("caption");
+        count_label.set_tooltip_text(Some(&format!("{count} session(s)")));
+        row.add_suffix(&count_label);
         row.set_margin_start(depth * INDENT);
-        row.add_prefix(&gtk::Image::from_icon_name(if collapsed {
-            "folder-symbolic"
-        } else {
-            "folder-open-symbolic"
-        }));
+        row.add_css_class("leeloo-folder");
+        let icon = gtk::Image::from_icon_name(folder_icon(collapsed));
+        row.add_prefix(&icon);
 
         let icon_button = |icon: &str, tooltip: &str| {
             let button = gtk::Button::from_icon_name(icon);
@@ -214,12 +422,10 @@ impl Panel {
                         collapsed.insert(path.clone());
                     }
                 }
-                // Reconstruction différée : la ligne ne se détruit pas pendant son signal.
-                let panel = panel.clone();
-                gtk::glib::idle_add_local_once(move || panel.refresh());
+                panel.apply_collapsed();
             }
         });
-        row
+        (row, icon)
     }
 
     /// Menu « … » d'un dossier : renommer, déplacer, supprimer.
@@ -380,7 +586,7 @@ impl Panel {
         let dialog = adw::AlertDialog::new(
             Some("Supprimer le dossier ?"),
             Some(&format!(
-                "« {label} », ses sous-dossiers et {count} session(s) seront supprimés définitivement."
+                "« {label} », ses sous-dossiers et {count} session(s) seront supprimés (annulable quelques secondes)."
             )),
         );
         dialog.add_responses(&[("cancel", "Annuler"), ("delete", "Supprimer")]);
@@ -401,24 +607,64 @@ impl Panel {
     }
 
     fn delete_folder(self: &Rc<Self>, path: &str) {
-        let result = self.store.borrow_mut().delete_folder(path);
+        let result = self.store.borrow_mut().take_folder(path);
         match result {
-            Ok(removed) => {
-                self.collapsed.borrow_mut().retain(|collapsed| {
-                    collapsed != path
-                        && !collapsed.starts_with(&format!("{path}{FOLDER_SEPARATOR}"))
-                });
+            Ok(backup) => {
+                let prefix = format!("{path}{FOLDER_SEPARATOR}");
+                // Dossiers repliés retirés, rendus à l'annulation.
+                let removed_collapsed: Vec<String> = {
+                    let mut collapsed = self.collapsed.borrow_mut();
+                    let removed = collapsed
+                        .iter()
+                        .filter(|known| known.as_str() == path || known.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    collapsed.retain(|known| known != path && !known.starts_with(&prefix));
+                    removed
+                };
                 self.save();
                 let panel = self.clone();
                 gtk::glib::idle_add_local_once(move || {
                     panel.refresh();
-                    if removed > 0 {
-                        panel.toast(&format!("{removed} session(s) supprimée(s)"));
-                    }
+                    panel.offer_undo(backup, removed_collapsed);
                 });
             }
             Err(error) => self.toast(&format!("Suppression impossible : {error}")),
         }
+    }
+
+    /// Message « Dossier supprimé » avec un bouton « Annuler » (10 s).
+    fn offer_undo(self: &Rc<Self>, backup: FolderBackup, collapsed: Vec<String>) {
+        let sessions = backup.session_count();
+        let label = backup.path().replace(FOLDER_SEPARATOR, " › ");
+        let title = if sessions > 0 {
+            format!("Dossier « {label} » supprimé ({sessions} session(s))")
+        } else {
+            format!("Dossier « {label} » supprimé")
+        };
+        let toast = adw::Toast::builder()
+            .title(gtk::glib::markup_escape_text(&title))
+            .button_label("Annuler")
+            .timeout(10)
+            .build();
+        // Annulation unique : le bouton consomme la sauvegarde.
+        let backup = RefCell::new(Some(backup));
+        let collapsed = RefCell::new(Some(collapsed));
+        toast.connect_button_clicked({
+            let panel = self.clone();
+            move |_| {
+                let (Some(backup), Some(collapsed)) =
+                    (backup.borrow_mut().take(), collapsed.borrow_mut().take())
+                else {
+                    return;
+                };
+                panel.store.borrow_mut().restore_folder(backup);
+                panel.collapsed.borrow_mut().extend(collapsed);
+                panel.save();
+                panel.refresh();
+            }
+        });
+        self.toasts.add_toast(toast);
     }
 
     /// Demande le nom d'un dossier ; « Azure/Dev » crée les deux niveaux.
@@ -473,9 +719,11 @@ impl Panel {
     fn session_row(self: &Rc<Self>, session: &Session) -> adw::ActionRow {
         let row = adw::ActionRow::builder()
             .title(gtk::glib::markup_escape_text(&session.name))
-            .subtitle(gtk::glib::markup_escape_text(&session.summary()))
             .activatable(true)
             .build();
+        // Hôte ou VM en infobulle : la ligne reste fine (une seule ligne).
+        row.set_tooltip_text(Some(&session.summary()));
+        row.add_css_class("leeloo-session");
         let id = session.id;
         // `#rrggbb` validé par le modèle : sans risque dans le balisage Pango.
         if let Some(color) = session
@@ -522,11 +770,13 @@ impl Panel {
         };
         match session.argv() {
             Ok(argv) => {
-                let style = terminal::TabStyle {
-                    color: session.color.clone(),
-                    palette: session.palette.as_deref().and_then(palette::by_id),
-                };
-                terminal::open_session_tab(&self.tab_view, &session.name, argv, style);
+                terminal::open_session_tab(
+                    &self.tab_view,
+                    &session.name,
+                    argv,
+                    tab_style(&session),
+                    PaneSource::Session { id },
+                );
             }
             Err(error) => self.toast(&format!("Session invalide : {error}")),
         }

@@ -10,6 +10,11 @@ pub const MAX_OPACITY_PERCENT: u8 = 100;
 pub const MIN_SIDEBAR_WIDTH: i32 = 200;
 pub const MAX_SIDEBAR_WIDTH: i32 = 700;
 pub const DEFAULT_SIDEBAR_WIDTH: i32 = 300;
+pub const MIN_FONT_SCALE_PERCENT: u16 = 50;
+pub const MAX_FONT_SCALE_PERCENT: u16 = 300;
+pub const DEFAULT_FONT_SCALE_PERCENT: u16 = 100;
+/// Pas d'un cran de zoom (raccourcis clavier, molette).
+pub const FONT_SCALE_STEP_PERCENT: u16 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +59,15 @@ pub struct Settings {
     pub sidebar_visible: bool,
     /// Largeur du panneau des sessions, en pixels (200 à 700).
     pub sidebar_width: i32,
+    /// Zoom de la police du terminal, de 50 à 300 %.
+    pub font_scale_percent: u16,
+    /// Rouvre les onglets et divisions de la dernière session au lancement.
+    pub restore_session: bool,
+    /// Demande confirmation avant de fermer un onglet, un volet ou la fenêtre
+    /// quand une commande ou une connexion est encore active.
+    pub confirm_close: bool,
+    /// Notification de bureau à la fin d'une commande longue (onglet non regardé).
+    pub notify_on_finish: bool,
 }
 
 impl Default for Settings {
@@ -65,6 +79,10 @@ impl Default for Settings {
             palette: DEFAULT_PALETTE_ID.to_owned(),
             sidebar_visible: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
+            restore_session: true,
+            confirm_close: true,
+            notify_on_finish: true,
         }
     }
 }
@@ -79,6 +97,22 @@ pub fn clamp_opacity_percent(value: u8) -> u8 {
     value.clamp(MIN_OPACITY_PERCENT, MAX_OPACITY_PERCENT)
 }
 
+/// Borne le zoom : une police minuscule ou géante rendrait le terminal inutilisable.
+pub fn clamp_font_scale_percent(value: u16) -> u16 {
+    value.clamp(MIN_FONT_SCALE_PERCENT, MAX_FONT_SCALE_PERCENT)
+}
+
+/// Zoom après `steps` crans (positif = agrandir), borné.
+pub fn step_font_scale_percent(current: u16, steps: i32) -> u16 {
+    let delta = steps.saturating_mul(i32::from(FONT_SCALE_STEP_PERCENT));
+    let target = i32::from(current).saturating_add(delta);
+    let bounded = target.clamp(
+        i32::from(MIN_FONT_SCALE_PERCENT),
+        i32::from(MAX_FONT_SCALE_PERCENT),
+    );
+    u16::try_from(bounded).unwrap_or(DEFAULT_FONT_SCALE_PERCENT)
+}
+
 impl Settings {
     pub fn default_path() -> Option<PathBuf> {
         private_file::config_dir().map(|directory| directory.join("settings.json"))
@@ -91,6 +125,8 @@ impl Settings {
                 .map(|mut settings| {
                     settings.opacity_percent = clamp_opacity_percent(settings.opacity_percent);
                     settings.sidebar_width = clamp_sidebar_width(settings.sidebar_width);
+                    settings.font_scale_percent =
+                        clamp_font_scale_percent(settings.font_scale_percent);
                     // Palette supprimée ou inconnue : retour au défaut, sans erreur.
                     if palette::by_id(&settings.palette).is_none() {
                         settings.palette = DEFAULT_PALETTE_ID.to_owned();
@@ -204,6 +240,29 @@ mod tests {
     }
 
     #[test]
+    fn font_scale_steps_are_bounded() {
+        assert_eq!(step_font_scale_percent(100, 1), 110);
+        assert_eq!(step_font_scale_percent(100, -2), 80);
+        assert_eq!(step_font_scale_percent(295, 1), 300);
+        assert_eq!(step_font_scale_percent(55, -1), 50);
+        assert_eq!(step_font_scale_percent(100, i32::MAX), 300);
+        assert_eq!(step_font_scale_percent(100, i32::MIN), 50);
+    }
+
+    #[test]
+    fn font_scale_is_clamped_on_load() {
+        let directory = temporary_directory("font-scale");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("settings.json");
+        std::fs::write(&path, r#"{"font_scale_percent": 5000}"#).unwrap();
+        assert_eq!(Settings::load(&path).unwrap().font_scale_percent, 300);
+        std::fs::write(&path, r#"{"font_scale_percent": 1}"#).unwrap();
+        assert_eq!(Settings::load(&path).unwrap().font_scale_percent, 50);
+        assert_eq!(Settings::default().font_scale_percent, 100);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn missing_file_gives_defaults() {
         let path = temporary_directory("missing").join("settings.json");
         assert_eq!(Settings::load(&path).unwrap(), Settings::default());
@@ -220,6 +279,10 @@ mod tests {
             palette: "nord".to_owned(),
             sidebar_visible: false,
             sidebar_width: 450,
+            font_scale_percent: 130,
+            restore_session: false,
+            confirm_close: false,
+            notify_on_finish: false,
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), settings);

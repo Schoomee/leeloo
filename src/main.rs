@@ -7,10 +7,11 @@ mod terminal;
 use adw::prelude::*;
 use leeloo::palette::{self, DEFAULT_PALETTE_ID, PALETTES};
 use leeloo::settings::{
-    MAX_OPACITY_PERCENT, MIN_OPACITY_PERCENT, MIN_SIDEBAR_WIDTH, Settings, Theme,
-    clamp_opacity_percent, clamp_sidebar_width,
+    DEFAULT_FONT_SCALE_PERCENT, MAX_OPACITY_PERCENT, MIN_OPACITY_PERCENT, MIN_SIDEBAR_WIDTH,
+    Settings, Theme, clamp_opacity_percent, clamp_sidebar_width, step_font_scale_percent,
 };
 use leeloo::tab_nav::nth_tab_index;
+use leeloo::workspace::{PaneSource, Workspace};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -22,7 +23,12 @@ fn main() -> gtk::glib::ExitCode {
     if let Err(error) = leeloo::private_file::migrate_legacy_config_dir() {
         eprintln!("Reprise de l'ancienne configuration impossible : {error}");
     }
+    // Sous X11, la classe de fenêtre (WM_CLASS) vient du nom de programme : elle
+    // doit valoir l'identifiant de l'application pour que le gestionnaire de
+    // fenêtres retrouve le `.desktop` (StartupWMClass) et donc l'icône.
+    gtk::glib::set_prgname(Some(APP_ID));
     let application = adw::Application::builder().application_id(APP_ID).build();
+    application.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
     application.connect_activate(build_window);
     application.run()
 }
@@ -78,7 +84,7 @@ fn build_window(application: &adw::Application) {
 
     let (sessions_widget, sessions) = sessions_panel::build(&tab_view, &toasts, &window);
     install_tab_shortcuts(application, &window, &tab_view);
-    install_window_actions(
+    let preferences = install_window_actions(
         application,
         &window,
         &header,
@@ -100,23 +106,140 @@ fn build_window(application: &adw::Application) {
         let window = window.clone();
         let tab_view = tab_view.clone();
         let toasts = toasts.clone();
+        let sessions = sessions.clone();
         move |_| azure_dialog::present(&window, &tab_view, &toasts, &sessions)
     });
 
     // Ferme la fenêtre quand le dernier onglet est fermé.
+    // Ferme l'onglet, après confirmation s'il a une commande ou une connexion
+    // active (sinon immédiatement). Un refus doit être signalé à la vue.
     tab_view.connect_close_page({
         let window = window.clone();
         move |view, page| {
-            view.close_page_finish(page, true);
-            if view.n_pages() == 0 {
-                window.close();
+            let live = terminal::live_panes_in_page(page);
+            if live == 0 || !terminal::confirm_close_enabled() {
+                finish_tab_close(&window, view, page, true);
+            } else {
+                let (window_ref, view, page) = (window.clone(), view.clone(), page.clone());
+                terminal::confirm_dialog(
+                    Some(window.upcast_ref()),
+                    "Fermer cet onglet ?",
+                    &terminal::live_summary(live),
+                    "Fermer",
+                    move |accepted| finish_tab_close(&window_ref, &view, &page, accepted),
+                );
             }
             gtk::glib::Propagation::Stop
         }
     });
 
-    terminal::open_local_tab(&tab_view);
+    restore_or_open_first_tab(&tab_view, &sessions, &preferences, &toasts);
+    // Fermeture de la fenêtre : confirmation si des commandes ou connexions sont
+    // actives, puis enregistrement de la session.
+    let confirmed = Rc::new(std::cell::Cell::new(false));
+    window.connect_close_request({
+        let tab_view = tab_view.clone();
+        let sessions = sessions.clone();
+        let preferences = preferences.clone();
+        move |window| {
+            let live = terminal::live_panes(&tab_view);
+            if live > 0 && terminal::confirm_close_enabled() && !confirmed.get() {
+                let (target, confirmed) = (window.clone(), confirmed.clone());
+                terminal::confirm_dialog(
+                    Some(window.upcast_ref()),
+                    "Quitter Leeloo ?",
+                    &terminal::live_summary(live),
+                    "Quitter",
+                    move |accepted| {
+                        if accepted {
+                            confirmed.set(true);
+                            target.close();
+                        }
+                    },
+                );
+                return gtk::glib::Propagation::Stop;
+            }
+            save_workspace(&tab_view, &sessions, &preferences);
+            gtk::glib::Propagation::Proceed
+        }
+    });
     window.present();
+}
+
+/// Termine (ou refuse) la fermeture d'un onglet ; le dernier onglet ferme la
+/// fenêtre.
+fn finish_tab_close(
+    window: &adw::ApplicationWindow,
+    view: &adw::TabView,
+    page: &adw::TabPage,
+    confirmed: bool,
+) {
+    view.close_page_finish(page, confirmed);
+    if confirmed && view.n_pages() == 0 {
+        window.close();
+    }
+}
+
+/// Rouvre les onglets de la dernière session (si le réglage est actif), sinon
+/// ouvre un terminal local.
+fn restore_or_open_first_tab(
+    tab_view: &adw::TabView,
+    sessions: &sessions_panel::SessionsHandle,
+    preferences: &Preferences,
+    toasts: &adw::ToastOverlay,
+) {
+    if preferences.settings.borrow().restore_session
+        && let Some(path) = Workspace::default_path()
+    {
+        match Workspace::load(&path) {
+            Ok(workspace) => {
+                sessions.restore_collapsed(&workspace.collapsed_folders);
+                let resolve = |source: &PaneSource| sessions.resolve_pane(source);
+                let mut selected_page = None;
+                for (index, tab) in workspace.tabs.iter().enumerate() {
+                    if terminal::restore_tab(tab_view, tab, &resolve) && index == workspace.selected
+                    {
+                        selected_page = Some(tab_view.nth_page(tab_view.n_pages() - 1));
+                    }
+                }
+                if let Some(page) = selected_page.or_else(|| tab_view.selected_page()) {
+                    tab_view.set_selected_page(&page);
+                    terminal::focus_selected(tab_view);
+                }
+            }
+            Err(error) => {
+                toasts.add_toast(adw::Toast::new(&format!("Restauration ignorée : {error}")))
+            }
+        }
+    }
+    if tab_view.n_pages() == 0 {
+        terminal::open_local_tab(tab_view);
+    }
+}
+
+/// Enregistre les onglets ouverts à la fermeture. Réglage coupé : rien n'est
+/// écrit, et un ancien fichier est supprimé pour ne pas ressurgir plus tard.
+fn save_workspace(
+    tab_view: &adw::TabView,
+    sessions: &sessions_panel::SessionsHandle,
+    preferences: &Preferences,
+) {
+    let Some(path) = Workspace::default_path() else {
+        return;
+    };
+    if !preferences.settings.borrow().restore_session {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    let (tabs, selected) = terminal::capture_workspace(tab_view);
+    let workspace = Workspace {
+        tabs,
+        selected,
+        collapsed_folders: sessions.collapsed_folders(),
+    };
+    if let Err(error) = workspace.save(&path) {
+        eprintln!("Sauvegarde de la session impossible : {error}");
+    }
 }
 
 /// Fenêtre transparente (le terminal translucide laisse voir le bureau). Le
@@ -126,7 +249,35 @@ const APP_CSS: &str = "\
 window.leeloo-translucent { background: transparent; }\n\
 window.leeloo-translucent toolbarview > .top-bar { background-color: @headerbar_bg_color; }\n\
 window.leeloo-translucent tabbar { background-color: @headerbar_bg_color; }\n\
-.leeloo-sidebar { background-color: @window_bg_color; }";
+window.leeloo-translucent paned > separator { background-color: @window_bg_color; }\n\
+.leeloo-sidebar { background-color: @window_bg_color; }\n\
+.leeloo-broadcast { outline: 2px solid @error_color; outline-offset: -2px; }\n\
+list.leeloo-row-list { padding: 0; }\n\
+row.leeloo-folder { margin-top: 2px; margin-bottom: 2px; border-radius: 8px; min-height: 0; \
+border: 1px solid alpha(@window_fg_color, 0.12); \
+background-image: linear-gradient(to bottom, alpha(@window_fg_color, 0.10), alpha(@window_fg_color, 0.02)); \
+box-shadow: inset 0 1px 0 alpha(white, 0.14), 0 2px 4px alpha(black, 0.35); \
+transition: box-shadow 150ms ease, background-image 150ms ease; }\n\
+row.leeloo-folder > box.header { min-height: 32px; padding-top: 0; padding-bottom: 0; }\n\
+row.leeloo-session { min-height: 0; margin-top: 1px; margin-bottom: 1px; }\n\
+row.leeloo-session > box.header { min-height: 30px; padding-top: 0; padding-bottom: 0; }\n\
+row.leeloo-folder:hover { \
+background-image: linear-gradient(to bottom, alpha(@window_fg_color, 0.16), alpha(@window_fg_color, 0.05)); \
+box-shadow: inset 0 1px 0 alpha(white, 0.20), 0 4px 8px alpha(black, 0.40); }\n\
+tabbar tab { border-radius: 8px; \
+border: 1px solid alpha(@window_fg_color, 0.12); \
+background-image: linear-gradient(to bottom, alpha(@window_fg_color, 0.08), alpha(@window_fg_color, 0.01)); \
+box-shadow: inset 0 1px 0 alpha(white, 0.12), 0 2px 3px alpha(black, 0.30); \
+transition: box-shadow 150ms ease, background-image 150ms ease; }\n\
+tabbar tab:hover { \
+background-image: linear-gradient(to bottom, alpha(@window_fg_color, 0.14), alpha(@window_fg_color, 0.04)); \
+box-shadow: inset 0 1px 0 alpha(white, 0.18), 0 3px 6px alpha(black, 0.36); }\n\
+tabbar tab:selected { \
+background-image: linear-gradient(to bottom, alpha(@window_fg_color, 0.20), alpha(@window_fg_color, 0.07)); \
+box-shadow: inset 0 1px 0 alpha(white, 0.24), 0 4px 8px alpha(black, 0.42); }\n\
+row.leeloo-folder:active { \
+box-shadow: inset 0 2px 4px alpha(black, 0.40); \
+background-image: linear-gradient(to bottom, alpha(@window_fg_color, 0.02), alpha(@window_fg_color, 0.08)); }";
 
 /// Éléments du volet des sessions manipulés par les préférences.
 struct SidebarParts<'a> {
@@ -168,6 +319,9 @@ impl Preferences {
             self.window.remove_css_class("leeloo-translucent");
         }
         terminal::set_copy_on_select(settings.copy_on_select);
+        terminal::set_confirm_close(settings.confirm_close);
+        terminal::set_notify_on_finish(settings.notify_on_finish);
+        terminal::set_font_scale_percent(settings.font_scale_percent);
         terminal::set_appearance(terminal::Appearance {
             dark: style_manager.is_dark(),
             opacity_percent: settings.opacity_percent,
@@ -334,7 +488,7 @@ fn install_window_actions(
     toasts: &adw::ToastOverlay,
     tab_view: &adw::TabView,
     sidebar: &SidebarParts,
-) {
+) -> Rc<Preferences> {
     use gtk::gio;
 
     let settings_path = Settings::default_path();
@@ -373,6 +527,56 @@ fn install_window_actions(
         }
     });
     window.add_action(&copy_on_select);
+
+    let restore_session = gio::SimpleAction::new_stateful(
+        "restore-session",
+        None,
+        &preferences.settings.borrow().restore_session.to_variant(),
+    );
+    restore_session.connect_activate({
+        let preferences = preferences.clone();
+        move |action, _| {
+            let enabled = !preferences.settings.borrow().restore_session;
+            preferences.settings.borrow_mut().restore_session = enabled;
+            action.set_state(&enabled.to_variant());
+            preferences.persist();
+        }
+    });
+    window.add_action(&restore_session);
+
+    let confirm_close = gio::SimpleAction::new_stateful(
+        "confirm-close",
+        None,
+        &preferences.settings.borrow().confirm_close.to_variant(),
+    );
+    confirm_close.connect_activate({
+        let preferences = preferences.clone();
+        move |action, _| {
+            let enabled = !preferences.settings.borrow().confirm_close;
+            preferences.settings.borrow_mut().confirm_close = enabled;
+            action.set_state(&enabled.to_variant());
+            preferences.apply();
+            preferences.persist();
+        }
+    });
+    window.add_action(&confirm_close);
+
+    let notify_on_finish = gio::SimpleAction::new_stateful(
+        "notify-on-finish",
+        None,
+        &preferences.settings.borrow().notify_on_finish.to_variant(),
+    );
+    notify_on_finish.connect_activate({
+        let preferences = preferences.clone();
+        move |action, _| {
+            let enabled = !preferences.settings.borrow().notify_on_finish;
+            preferences.settings.borrow_mut().notify_on_finish = enabled;
+            action.set_state(&enabled.to_variant());
+            preferences.apply();
+            preferences.persist();
+        }
+    });
+    window.add_action(&notify_on_finish);
 
     let theme_action = gio::SimpleAction::new_stateful(
         "theme",
@@ -417,6 +621,35 @@ fn install_window_actions(
         }
     });
     window.add_action(&palette_action);
+
+    // Zoom de la police : -1 / +1 cran, 0 = taille normale.
+    let zoom_action = gio::SimpleAction::new("zoom", Some(gtk::glib::VariantTy::INT32));
+    zoom_action.connect_activate({
+        let preferences = preferences.clone();
+        move |_, parameter| {
+            let Some(steps) = parameter.and_then(|value| value.get::<i32>()) else {
+                return;
+            };
+            let current = preferences.settings.borrow().font_scale_percent;
+            let next = if steps == 0 {
+                DEFAULT_FONT_SCALE_PERCENT
+            } else {
+                step_font_scale_percent(current, steps)
+            };
+            if next != current {
+                preferences.settings.borrow_mut().font_scale_percent = next;
+                preferences.apply();
+                preferences.persist();
+            }
+        }
+    });
+    window.add_action(&zoom_action);
+    application.set_accels_for_action(
+        "win.zoom(1)",
+        &["<Control>plus", "<Control>equal", "<Control>KP_Add"],
+    );
+    application.set_accels_for_action("win.zoom(-1)", &["<Control>minus", "<Control>KP_Subtract"]);
+    application.set_accels_for_action("win.zoom(0)", &["<Control>0", "<Control>KP_0"]);
 
     // Renommage : onglet sélectionné (menu du terminal, Ctrl+Maj+R) ou onglet
     // visé par le clic droit sur sa languette.
@@ -490,8 +723,22 @@ fn install_window_actions(
     opacity_item.set_attribute_value("custom", Some(&"opacity".to_variant()));
     opacity_section.append_item(&opacity_item);
     menu.append_section(Some("Opacité du fond"), &opacity_section);
+    let zoom_section = gio::Menu::new();
+    zoom_section.append(Some("Agrandir la police (Ctrl++)"), Some("win.zoom(1)"));
+    zoom_section.append(Some("Réduire la police (Ctrl+-)"), Some("win.zoom(-1)"));
+    zoom_section.append(Some("Taille normale (Ctrl+0)"), Some("win.zoom(0)"));
+    menu.append_section(Some("Zoom de la police"), &zoom_section);
     let options_section = gio::Menu::new();
     options_section.append(Some("Copier à la sélection"), Some("win.copy-on-select"));
+    options_section.append(
+        Some("Restaurer les onglets au lancement"),
+        Some("win.restore-session"),
+    );
+    options_section.append(Some("Confirmer avant de fermer"), Some("win.confirm-close"));
+    options_section.append(
+        Some("Notifier en fin de commande"),
+        Some("win.notify-on-finish"),
+    );
     options_section.append(
         Some("Panneau des sessions (F9)"),
         Some("win.toggle-sidebar"),
@@ -539,4 +786,5 @@ fn install_window_actions(
         move |_| preferences.apply()
     });
     preferences.apply();
+    preferences
 }

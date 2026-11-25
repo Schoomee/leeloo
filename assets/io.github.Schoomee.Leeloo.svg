@@ -1,10 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <rect x="8" y="16" width="112" height="96" rx="14" fill="#1e1e1e"/>
-  <rect x="8" y="16" width="112" height="22" rx="14" fill="#3584e4"/>
-  <rect x="8" y="28" width="112" height="10" fill="#3584e4"/>
-  <circle cx="24" cy="27" r="4" fill="#ffffff" fill-opacity="0.85"/>
-  <circle cx="38" cy="27" r="4" fill="#ffffff" fill-opacity="0.55"/>
-  <path d="M30 60 L52 76 L30 92" fill="none" stroke="#33d17a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="62" y="88" width="34" height="8" rx="4" fill="#d3d7cf"/>
+  <defs>
+    <linearGradient id="fond" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2f5a"/>
+      <stop offset="1" stop-color="#12142b"/>
+    </linearGradient>
+    <linearGradient id="chevron" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#ff6a00"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#fond)"/>
+  <rect x="4.5" y="4.5" width="119" height="119" rx="27.5" fill="none" stroke="#ffffff" stroke-opacity="0.12"/>
+  <!-- anneau du « laissez-passer » et ses quatre éléments -->
+  <circle cx="64" cy="64" r="44" fill="none" stroke="#7fd4ff" stroke-opacity="0.35" stroke-width="3"/>
+  <circle cx="64" cy="20" r="7" fill="#ff7800"/>
+  <circle cx="108" cy="64" r="7" fill="#3584e4"/>
+  <circle cx="64" cy="108" r="7" fill="#986a44"/>
+  <circle cx="20" cy="64" r="7" fill="#e8e8e8"/>
+  <!-- invite de commande -->
+  <path d="M46 46 L70 64 L46 82" fill="none" stroke="url(#chevron)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="76" y="78" width="20" height="9" rx="4.5" fill="#7fd4ff"/>
 </svg>
